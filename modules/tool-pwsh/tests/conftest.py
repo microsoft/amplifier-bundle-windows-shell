@@ -1,11 +1,17 @@
-"""
-Pytest configuration for module tests.
+"""Pytest configuration for tool-pwsh tests.
 
-Behavioral tests use inheritance from amplifier-core base classes.
-See tests/test_behavioral.py for the inherited tests.
-
-The amplifier-core pytest plugin provides fixtures automatically:
-- module_path: Detected path to this module
-- module_type: Detected type (provider, tool, hook, etc.)
-- provider_module, tool_module, etc.: Mounted module instances
+Adds the module's own directory to sys.path so
+``amplifier_module_tool_pwsh`` is importable without requiring a package
+install/build step first -- this module has no dependencies beyond the
+amplifier-core peer dependency, so a plain sys.path insertion is sufficient
+and keeps the test suite runnable with just ``pytest`` from this directory.
 """
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+_MODULE_ROOT = Path(__file__).resolve().parent.parent
+if str(_MODULE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_MODULE_ROOT))
