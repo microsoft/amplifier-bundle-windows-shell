@@ -1,0 +1,75 @@
+// The windows-shell bundle gives an AI assistant the ability to run PowerShell commands on Windows machines.
+
+digraph windows_shell {
+    rankdir=LR
+    fontname="Helvetica"
+    fontsize=12
+    label="Windows Shell Bundle v0.1.0\nGives the assistant PowerShell command access on Windows"
+    labelloc=t
+    labeljust=c
+    nodesep=0.6
+    ranksep=0.7
+    bgcolor="white"
+    source_hash="3b5b9a8172a78c9c1f74731e90e801f71425bb1d33d949d555247565d2d18041"
+
+    node [fontname="Helvetica", fontsize=11, style="filled,rounded"]
+    edge [fontname="Helvetica", fontsize=9]
+
+    root_windows_shell [label="Windows Shell Bundle v0.1.0\nThe main package\n0 tools · 0 agents\n~834 tok aggregate", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", penwidth=2]
+
+    subgraph cluster_behaviors {
+        label="Capabilities This Bundle Adds"
+        style="filled"
+        fillcolor="#f9f9f9"
+        color="#999999"
+
+        beh_windows_shell_behavior [label="PowerShell Capability\nBundles the tool with its guidance\n1 tools · 1 ctx\n~834 tok", shape=box, fillcolor="#e0f2f1", style="filled,rounded"]
+    }
+
+    subgraph cluster_modules {
+        label="Working Parts (Code)"
+        style="filled"
+        fillcolor="#f9f9f9"
+        color="#999999"
+
+        mod_tool_pwsh [label="PowerShell Runner (tool-pwsh)\nRuns commands on Windows\n1 tool · ~119 tok", shape=box, fillcolor="#bbdefb", style="filled,rounded"]
+    }
+
+    subgraph cluster_context {
+        label="Written Guidance for the Assistant"
+        style="filled"
+        fillcolor="#f9f9f9"
+        color="#999999"
+
+        ctx_windows_shell_md [label="Windows Usage Notes\n(windows-shell.md)\n~700 tok", shape=box, fillcolor="#e1bee7", style="filled,rounded"]
+    }
+
+    subgraph cluster_legend {
+        label="What the Colors Mean"
+        style="filled"
+        fillcolor="white"
+        color="#cccccc"
+        fontsize=9
+
+        leg_root [label="main package", shape=box, fillcolor="#80cbc4", style="filled,rounded,bold", fontsize=9]
+        leg_behavior [label="capability", shape=box, fillcolor="#e0f2f1", style="filled,rounded", fontsize=9]
+        leg_agent [label="specialist helper", shape=box, fillcolor="#c8e6c9", style="filled,rounded", fontsize=9]
+        leg_module [label="working part (code)", shape=box, fillcolor="#bbdefb", style="filled,rounded", fontsize=9]
+        leg_provider [label="AI service", shape=box, fillcolor="#e0e0e0", style="filled,rounded", fontsize=9]
+        leg_context [label="written guidance", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
+        leg_standalone [label="ready to use alone", shape=box, fillcolor="#80cbc4", style="filled,rounded", fontsize=9]
+        leg_experiment [label="experimental", shape=box, fillcolor="#e1bee7", style="filled,rounded", fontsize=9]
+        leg_ext_cost [label="borrowed, adds cost", shape=box, fillcolor="#80cbc4", style="dashed", color="red", penwidth=2, fontsize=9]
+        leg_ext_muted [label="borrowed, no cost", shape=box, fillcolor="#f5f5f5", style="dashed", fontsize=9]
+    }
+
+    disclaimer [label="\"Tokens\" measure how much reading the AI does each turn (~4 characters = 1 token)\nSolid border = part of this repository (counted here)\nDashed + red = borrowed from elsewhere, adds hidden reading cost\nDashed + muted = borrowed from elsewhere, no reading cost\nNot counted: helper sessions, anything decided while running", shape=note, fillcolor="#eceff1", style="filled", fontsize=9]
+
+    ext_githttps___github_com_microsoft_amplifier_foundation_main [label="Amplifier Foundation\nShared base everything builds on\n(borrowed, adds cost)", shape=box, fillcolor="#80cbc4", style="dashed", color="red", penwidth=2]
+
+    root_windows_shell -> ext_githttps___github_com_microsoft_amplifier_foundation_main [style=dashed, label="builds on"]
+    root_windows_shell -> beh_windows_shell_behavior [label="includes"]
+    beh_windows_shell_behavior -> mod_tool_pwsh [label="uses", penwidth=0.8]
+    beh_windows_shell_behavior -> ctx_windows_shell_md [style=dotted, color=purple, label="reads"]
+    root_windows_shell -> ctx_windows_shell_md [style=dotted, color=purple, label="reads"]
+}
