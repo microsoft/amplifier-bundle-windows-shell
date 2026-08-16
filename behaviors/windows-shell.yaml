@@ -1,0 +1,18 @@
+bundle:
+  name: windows-shell-behavior
+  version: 0.1.0
+  description: >-
+    Adds the PowerShell (pwsh) tool and Windows shell guidance.
+    Compose onto any foundation bundle to give agents a native Windows shell
+    and platform-aware tool preference. On non-Windows hosts the tool degrades
+    without error, so the behavior is safe to compose unconditionally.
+
+tools:
+  - module: tool-pwsh
+    source: ../modules/tool-pwsh
+    config:
+      safety_profile: standard
+
+context:
+  include:
+    - windows-shell:context/windows-shell.md
